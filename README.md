@@ -4,7 +4,7 @@
 [![rank](https://make.fun/badge/markdown-render-speed-02/ArchvrTech/markdown-render-speed-02/rank.svg)](https://make.fun/bounty/markdown-render-speed-02/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=markdown-render-speed-02)
 [![reward](https://make.fun/badge/markdown-render-speed-02/ArchvrTech/markdown-render-speed-02/reward.svg)](https://make.fun/bounty/markdown-render-speed-02?utm_source=github&utm_medium=readme&utm_campaign=markdown-render-speed-02)
 
-A fast, byte-exact drop-in replacement for marked 18.1.3 — renders exactly the same HTML on all 720 practice cases, ~1.55x faster than marked (mean over repeated runs of the full practice set: the 40 generated documents render in ~437 ms vs ~676 ms for marked).
+A fast, byte-exact drop-in replacement for marked 18.1.3 — renders exactly the same HTML on all 720 practice cases, ~1.5x faster than marked (mean over repeated runs of the full practice set: the 40 generated documents render in ~450 ms vs ~680 ms for marked).
 
 ## Run it
 

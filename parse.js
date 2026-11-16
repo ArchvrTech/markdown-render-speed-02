@@ -98,18 +98,19 @@ function stripTrailing(str, ch, invert) {
 
 const BLANK_LINE = /^[ \t]*$/;
 
-// First char after up to 3 leading spaces (the `^ {0,3}` prefix most block
-// patterns share). NaN past the end.
+// First char after up to 3 leading spaces — the `^ {0,3}` prefix most block
+// patterns share. NaN past the end of the string.
 function afterSpaces(src) {
   let i = 0;
   while (i < 3 && src.charCodeAt(i) === 32) i++;
   return src.charCodeAt(i);
 }
 
-// Setext underline present? Scan line starts for a line of only = or -
-// (after up to 3 spaces, trailing spaces/tabs allowed), stopping at the
-// first blank line — a paragraph body cannot cross one. A manual scan: the
-// regex /\n {0,3}[=-]/ scans the whole remaining document per paragraph.
+// Does a setext underline exist ahead? Walk line starts looking for a line
+// of only = or - (up to 3 leading spaces, trailing spaces/tabs allowed),
+// stopping at the first blank line — a paragraph body cannot cross one.
+// A manual scan: the regex /\n {0,3}[=-]/ scans the whole remaining
+// document on every paragraph.
 function hasSetextUnderline(src) {
   const n = src.length;
   let i = 0;
