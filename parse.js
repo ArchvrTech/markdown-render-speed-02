@@ -98,6 +98,48 @@ function stripTrailing(str, ch, invert) {
 
 const BLANK_LINE = /^[ \t]*$/;
 
+// First char after up to 3 leading spaces (the `^ {0,3}` prefix most block
+// patterns share). NaN past the end.
+function afterSpaces(src) {
+  let i = 0;
+  while (i < 3 && src.charCodeAt(i) === 32) i++;
+  return src.charCodeAt(i);
+}
+
+// Setext underline present? Scan line starts for a line of only = or -
+// (after up to 3 spaces, trailing spaces/tabs allowed), stopping at the
+// first blank line — a paragraph body cannot cross one. A manual scan: the
+// regex /\n {0,3}[=-]/ scans the whole remaining document per paragraph.
+function hasSetextUnderline(src) {
+  const n = src.length;
+  let i = 0;
+  while (i < n) {
+    const nl = src.indexOf('\n', i);
+    if (nl === -1) return false;
+    let j = nl + 1;
+    let sp = 0;
+    while (sp < 3 && src.charCodeAt(j) === 32) { j++; sp++; }
+    const c = src.charCodeAt(j);
+    if (c === 61 || c === 45) {
+      let k = j;
+      while (src.charCodeAt(k) === c) k++;
+      let m = k;
+      while (src.charCodeAt(m) === 32 || src.charCodeAt(m) === 9) m++;
+      if (m >= n || src.charCodeAt(m) === 10) return true;
+    }
+    const nl2 = src.indexOf('\n', nl + 1);
+    const end = nl2 === -1 ? n : nl2;
+    let blank = true;
+    for (let q = nl + 1; q < end; q++) {
+      const cc = src.charCodeAt(q);
+      if (cc !== 32 && cc !== 9) { blank = false; break; }
+    }
+    if (blank) return false;
+    i = nl + 1;
+  }
+  return false;
+}
+
 // Drop trailing blank lines, keeping at most one blank line at the end.
 function trimBlankEnd(str) {
   const lines = str.split('\n');
@@ -318,8 +360,25 @@ const NOT_SPACE_START = /^\S*/;
 const ENDING_NEWLINE = /\n$/;
 const SPACE_LINE = /^ +$/gm;
 
+const itemRegexCache = new Map();
 function listItemRegex(marker) {
-  return new RegExp(`^( {0,3}${marker})((?:[ \t][^\n]*)?(?:\n|$))`);
+  let re = itemRegexCache.get(marker);
+  if (!re) {
+    re = new RegExp(`^( {0,3}${marker})((?:[ \t][^\n]*)?(?:\n|$))`);
+    itemRegexCache.set(marker, re);
+  }
+  return re;
+}
+
+// Ends with a double blank line: \n[ \t]*\n[ \t]*$ — the loose-list test,
+// without running a regex over the whole item text.
+function endsWithDoubleBlank(s) {
+  let i = s.length;
+  while (i > 0 && (s.charCodeAt(i - 1) === 32 || s.charCodeAt(i - 1) === 9)) i--;
+  if (i === 0 || s.charCodeAt(i - 1) !== 10) return false;
+  i--;
+  while (i > 0 && (s.charCodeAt(i - 1) === 32 || s.charCodeAt(i - 1) === 9)) i--;
+  return i > 0 && s.charCodeAt(i - 1) === 10;
 }
 const regexCache = [[], [], [], [], [], []];
 function cachedRegex(kind, n) {
@@ -363,6 +422,7 @@ class BlockLexer {
   constructor() {
     this.tokens = [];
     this.links = Object.create(null);
+    this._hasLinks = false;
     this.inlineQueue = [];
     this.state = { inLink: false, inRawBlock: false, linkEmitted: false, linkParenPossible: true, top: true };
   }
@@ -425,7 +485,7 @@ class BlockLexer {
           last.text += '\n' + tok.raw;
           this.inlineQueue.at(-1).src = last.text;
         } else {
-          if (!this.links[tok.tag]) this.links[tok.tag] = { href: tok.href, title: tok.title };
+          if (!this.links[tok.tag]) { this.links[tok.tag] = { href: tok.href, title: tok.title }; this._hasLinks = true; }
           tokens.push(tok);
         }
         continue;
@@ -463,12 +523,16 @@ class BlockLexer {
   }
 
   space(src) {
+    const c0 = src.charCodeAt(0);
+    if (c0 !== 10 && c0 !== 32 && c0 !== 9) return undefined;
     const t = RE.newline.exec(src);
     if (t && t[0].length > 0) return { type: 'space', raw: t[0] };
     return undefined;
   }
 
   code(src) {
+    const c0 = src.charCodeAt(0);
+    if (c0 !== 32 && c0 !== 9) return undefined;
     const t = RE.code.exec(src);
     if (!t) return undefined;
     const raw = trimBlankEnd(t[0]);
@@ -477,6 +541,8 @@ class BlockLexer {
   }
 
   fences(src) {
+    const c = afterSpaces(src);
+    if (c !== 96 && c !== 126) return undefined;
     const t = RE.fences.exec(src);
     if (!t) return undefined;
     const raw = t[0];
@@ -485,6 +551,7 @@ class BlockLexer {
   }
 
   heading(src) {
+    if (afterSpaces(src) !== 35) return undefined;
     const t = RE.heading.exec(src);
     if (!t) return undefined;
     let text = t[2].trim();
@@ -496,12 +563,15 @@ class BlockLexer {
   }
 
   hr(src) {
+    const c = afterSpaces(src);
+    if (c !== 45 && c !== 95 && c !== 42) return undefined;
     const t = RE.hr.exec(src);
     if (!t) return undefined;
     return { type: 'hr', raw: stripTrailing(t[0], '\n') };
   }
 
   html(src) {
+    if (afterSpaces(src) !== 60) return undefined;
     const t = RE.html.exec(src);
     if (!t) return undefined;
     const raw = trimBlankEnd(t[0]);
@@ -509,6 +579,7 @@ class BlockLexer {
   }
 
   def(src) {
+    if (afterSpaces(src) !== 91) return undefined;
     const t = RE.def.exec(src);
     if (!t) return undefined;
     if (!START_ANGLE.test(t[2]) && findParen(t[2]) !== -1) return undefined;
@@ -519,6 +590,13 @@ class BlockLexer {
   }
 
   table(src) {
+    // Pre-check: the delimiter line (2nd line) must contain : or |, else
+    // the table cannot match (TABLE_DELIMITER requires one in the delimiter).
+    const nl = src.indexOf('\n');
+    if (nl === -1) return undefined;
+    const nl2 = src.indexOf('\n', nl + 1);
+    const line2 = nl2 === -1 ? src.slice(nl + 1) : src.slice(nl + 1, nl2);
+    if (!line2.includes(':') && !line2.includes('|')) return undefined;
     const t = RE.table.exec(src);
     if (!t || !TABLE_DELIMITER.test(t[2])) return undefined;
     const headerCells = splitTableRow(t[1]);
@@ -544,6 +622,10 @@ class BlockLexer {
   }
 
   lheading(src) {
+    // Necessary condition for a setext underline: a line starting with =
+    // or - after the paragraph body. Skip the large composed regex when it
+    // cannot match.
+    if (!hasSetextUnderline(src)) return undefined;
     const t = RE.lheading.exec(src);
     if (!t) return undefined;
     const text = t[1].trim();
@@ -569,6 +651,7 @@ class BlockLexer {
 // ---------------------------------------------------------------------------
 
 BlockLexer.prototype.blockquote = function (src) {
+  if (afterSpaces(src) !== 62) return undefined;
   const t = RE.blockquote.exec(src);
   if (!t) return undefined;
   let lines = stripTrailing(t[0], '\n').split('\n');
@@ -633,6 +716,8 @@ BlockLexer.prototype.blockquote = function (src) {
 };
 
 BlockLexer.prototype.list = function (src) {
+  const mc = afterSpaces(src);
+  if (!(mc === 42 || mc === 43 || mc === 45 || (mc >= 48 && mc <= 57))) return undefined;
   const t = RE.list.exec(src);
   if (!t) return undefined;
   const input = src;
@@ -682,14 +767,27 @@ BlockLexer.prototype.list = function (src) {
       while (src) {
         const nl = src.indexOf('\n');
         const line = nl === -1 ? src : src.slice(0, nl);
-        let expanded;
         nextLine = line;
-        expanded = line.replace(LEADING_SPACE_TAB, (v) => expandTabs(v));
+        // First non-space char (dispatch) and whether the leading
+        // whitespace holds a tab (only then does expanding tabs change it).
+        let ni = 0;
+        while (ni < line.length && line.charCodeAt(ni) === 32) ni++;
+        const hasTab = line.charCodeAt(ni) === 9;
+        const expanded = hasTab ? line.replace(LEADING_SPACE_TAB, (v) => expandTabs(v)) : line;
+        // First non-space char of `expanded` (== ni when no tab expanded it).
+        let fns;
+        if (!hasTab) {
+          fns = ni < line.length ? ni : -1;
+        } else {
+          fns = -1;
+          for (let k = 0; k < expanded.length; k++) {
+            if (expanded.charCodeAt(k) !== 32) { fns = k; break; }
+          }
+        }
+        const isBlank = line.trim() === '';
         // Fast dispatch: the six break regexes all start with ^ {0,maxSp}
         // followed by a marker char; skip the ones the first non-space
         // character cannot start (most content lines match none of them).
-        let ni = 0;
-        while (ni < line.length && line.charCodeAt(ni) === 32) ni++;
         let hit = false;
         if (ni <= maxSp && ni < line.length) {
           const ch = line[ni];
@@ -702,7 +800,7 @@ BlockLexer.prototype.list = function (src) {
           else if (ch === '_') hit = hrAt.test(line);
         }
         if (hit) break;
-        if (expanded.search(NON_SPACE_CHAR) >= indent || !line.trim()) {
+        if (fns >= indent || isBlank) {
           itemLines.push(expanded.slice(indent));
         } else {
           if (firstBlank || firstContent.replace(TAB_GLOBAL, '    ').search(NON_SPACE_CHAR) >= 4 || fencesAt.test(firstContent) || headingAt.test(firstContent) || htmlAt.test(firstContent) || hrAt.test(firstContent)) break;
@@ -710,7 +808,7 @@ BlockLexer.prototype.list = function (src) {
             ? `    ${expanded.replace(/^ {0,3}/, '')}` : line;
           itemLines.push(setext);
         }
-        firstBlank = !line.trim();
+        firstBlank = isBlank;
         src = src.substring(line.length + 1);
         firstContent = expanded.slice(indent);
       }
@@ -719,7 +817,7 @@ BlockLexer.prototype.list = function (src) {
     const itemRaw = input.slice(itemStart, consumed());
     if (!list.loose) {
       if (prevBlankEnded) list.loose = true;
-      else if (DOUBLE_BLANK_LINE.test(itemRaw)) prevBlankEnded = true;
+      else if (endsWithDoubleBlank(itemRaw)) prevBlankEnded = true;
     }
     list.items.push({
       type: 'list_item', raw: itemRaw, task: LIST_IS_TASK.test(itemText), loose: false, text: itemText, tokens: [],
@@ -1070,12 +1168,55 @@ function tkUrl(src) {
 }
 
 function tkInlineText(lx, src) {
+  // Scan the text run first (stops at markup chars / hard break / end),
+  // then check for URL/email triggers only inside that run — a trigger
+  // beyond the run belongs to a later token, not this one. This avoids
+  // rescanning the whole remaining paragraph on every text token.
+  const end = scanTextEnd(src, 0);
+  if (end > 0) {
+    const raw = src.slice(0, end);
+    if (raw.indexOf('@') === -1 && raw.indexOf('://') === -1 && raw.indexOf('www.') === -1
+      && raw.indexOf('mailto:') === -1 && raw.indexOf('xmpp:') === -1) {
+      const inRaw = lx.state.inRawBlock;
+      return { type: 'text', raw, text: inRaw ? raw : decodeEntities(raw), escaped: inRaw };
+    }
+  }
   const t = INLINE.text.exec(src);
   if (t) {
     const inRaw = lx.state.inRawBlock;
     return { type: 'text', raw: t[0], text: inRaw ? t[0] : decodeEntities(t[0]), escaped: inRaw };
   }
   return undefined;
+}
+
+// End index (exclusive) of the plain-text run starting at `start`, matching
+// the text regex's stop rules when no URL/email can start: stop before \ <
+// ! [ ` * ~ _, before a hard break (2+ spaces + newline), or at the end.
+// A leading run of backticks or tildes belongs to the text (a code span
+// would have matched first and failed to close). Always consumes at least
+// one character, as the regex does.
+function scanTextEnd(src, start) {
+  const n = src.length;
+  let i = start;
+  const c0 = src.charCodeAt(i);
+  if (c0 === 96 || c0 === 126) {
+    while (i < n && src.charCodeAt(i) === c0) i++;
+  } else {
+    i++;
+  }
+  while (i < n) {
+    const c = src.charCodeAt(i);
+    if (c === 92 || c === 60 || c === 33 || c === 91 || c === 96 || c === 42 || c === 126 || c === 95) break;
+    if (c === 32) {
+      let j = i + 1;
+      while (j < n && src.charCodeAt(j) === 32) j++;
+      if (j - i >= 2 && j < n && src.charCodeAt(j) === 10) break;
+      i = j;
+      continue;
+    }
+    i++;
+  }
+  return i;
 }
 
 // ---------------------------------------------------------------------------
@@ -1116,7 +1257,17 @@ function linkInText(lx, e) {
 
 function maskForEmphasis(lx, src) {
   let t = src;
-  if (lx.links && src.includes('[')) {
+  // Reflink/nolink masking can only change the string when a link
+  // definition exists and a reflink [a][b] or a nolink [a] (a ] not
+  // followed by () is present to close a label.
+  if (lx._hasLinks && src.includes('[') && src.includes(']')) {
+    let hasCand = false;
+    let idx = src.indexOf(']');
+    while (idx !== -1) {
+      if (src[idx + 1] === '[' || src[idx + 1] !== '(') { hasCand = true; break; }
+      idx = src.indexOf(']', idx + 1);
+    }
+    if (hasCand) {
     const re = INLINE.reflinkSearch;
     const maskReflink = (r) => {
       const o = r.lastIndexOf('[');
@@ -1128,6 +1279,7 @@ function maskForEmphasis(lx, src) {
       return '[' + 'a'.repeat(r.length - 2) + ']';
     };
     t = t.replace(re, maskReflink);
+    }
   }
   // anyPunctOutsideCode only changes backslash-escaped punctuation and
   // backticks inside code spans; skip the scan when neither can occur.
@@ -1138,8 +1290,8 @@ function maskForEmphasis(lx, src) {
       : m);
   }
   // blockSkip only hides [...]() links, code spans, and <...> tags; skip
-  // the scan when none of their opening characters can occur.
-  if (src.includes('[') || src.includes('`') || src.includes('<')) {
+  // the scan when none of their opening sequences can occur.
+  if (src.includes('](') || src.includes('`') || src.includes('<')) {
     t = t.replace(INLINE.blockSkip, (m, a, b) => {
       const o = b ? b.length : 0;
       return m.slice(0, o) + '[' + 'a'.repeat(m.length - o - 2) + ']';
@@ -1192,22 +1344,40 @@ function inlineTokensInner(lx, src, tokens) {
     if (!s) r = '';
     s = false;
     let i;
-    if (i = tkEscape(e)) { e = e.substring(i.raw.length); tokens.push(i); continue; }
-    if (i = tkTag(lx, e)) { e = e.substring(i.raw.length); tokens.push(i); continue; }
-    if (i = tkLink(lx, e)) { e = e.substring(i.raw.length); tokens.push(i); continue; }
-    if (i = tkReflink(lx, e)) {
-      e = e.substring(i.raw.length);
-      const p = tokens.at(-1);
-      if (i.type === 'text' && p?.type === 'text') { p.raw += i.raw; p.text += i.text; }
-      else tokens.push(i);
-      continue;
+    // First-character dispatch: each tokenizer can only match when the
+    // string starts with its trigger character, so try only those, in the
+    // same order as the linear chain, then fall through to plain text.
+    // (An email can start with _, so _ also tries the URL tokenizer.)
+    const ch = e.charCodeAt(0);
+    if (ch === 92) { // backslash: escape, br, text
+      if (i = tkEscape(e)) { e = e.substring(i.raw.length); tokens.push(i); continue; }
+      if (i = tkBr(e)) { e = e.substring(i.raw.length); tokens.push(i); continue; }
+    } else if (ch === 60) { // <: tag, autolink, text
+      if (i = tkTag(lx, e)) { e = e.substring(i.raw.length); tokens.push(i); continue; }
+      if (i = tkAutolink(e)) { e = e.substring(i.raw.length); tokens.push(i); continue; }
+    } else if (ch === 91 || ch === 33) { // [ or !: link, reflink, text
+      if (i = tkLink(lx, e)) { e = e.substring(i.raw.length); tokens.push(i); continue; }
+      if (i = tkReflink(lx, e)) {
+        e = e.substring(i.raw.length);
+        const p = tokens.at(-1);
+        if (i.type === 'text' && p?.type === 'text') { p.raw += i.raw; p.text += i.text; }
+        else tokens.push(i);
+        continue;
+      }
+    } else if (ch === 42) { // *: emStrong, text
+      if (i = tkEmStrong(lx, e, masked, r, maskInfo)) { e = e.substring(i.raw.length); tokens.push(i); continue; }
+    } else if (ch === 95) { // _: emStrong, url, text
+      if (i = tkEmStrong(lx, e, masked, r, maskInfo)) { e = e.substring(i.raw.length); tokens.push(i); continue; }
+      if (!lx.state.inLink && (i = tkUrl(e))) { e = e.substring(i.raw.length); tokens.push(i); continue; }
+    } else if (ch === 96) { // backtick: codespan, text
+      if (i = tkCodespan(e)) { e = e.substring(i.raw.length); tokens.push(i); continue; }
+    } else if (ch === 126) { // ~: del, text
+      if (i = tkDel(lx, e, masked, r, maskInfo)) { e = e.substring(i.raw.length); tokens.push(i); continue; }
+    } else if (ch === 32) { // space: br, text
+      if (i = tkBr(e)) { e = e.substring(i.raw.length); tokens.push(i); continue; }
+    } else { // other: url, text
+      if (!lx.state.inLink && (i = tkUrl(e))) { e = e.substring(i.raw.length); tokens.push(i); continue; }
     }
-    if (i = tkEmStrong(lx, e, masked, r, maskInfo)) { e = e.substring(i.raw.length); tokens.push(i); continue; }
-    if (i = tkCodespan(e)) { e = e.substring(i.raw.length); tokens.push(i); continue; }
-    if (i = tkBr(e)) { e = e.substring(i.raw.length); tokens.push(i); continue; }
-    if (i = tkDel(lx, e, masked, r, maskInfo)) { e = e.substring(i.raw.length); tokens.push(i); continue; }
-    if (i = tkAutolink(e)) { e = e.substring(i.raw.length); tokens.push(i); continue; }
-    if (!lx.state.inLink && (i = tkUrl(e))) { e = e.substring(i.raw.length); tokens.push(i); continue; }
     if (i = tkInlineText(lx, e)) {
       e = e.substring(i.raw.length);
       if (i.raw.slice(-1) !== '_') r = i.raw.slice(-1);
