@@ -4,9 +4,17 @@
 [![rank](https://make.fun/badge/markdown-render-speed-02/ArchvrTech/markdown-render-speed-02/rank.svg)](https://make.fun/bounty/markdown-render-speed-02/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=markdown-render-speed-02)
 [![reward](https://make.fun/badge/markdown-render-speed-02/ArchvrTech/markdown-render-speed-02/reward.svg)](https://make.fun/bounty/markdown-render-speed-02?utm_source=github&utm_medium=readme&utm_campaign=markdown-render-speed-02)
 
-A fast, byte-exact drop-in replacement for marked 18.1.3 — renders exactly the same HTML on all 720 practice cases, ~1.65x faster than marked (median over repeated interleaved runs of the 40 generated documents: ~415 ms vs ~685 ms for marked; kit scorer passes 720/720).
+A fast, byte-exact drop-in replacement for marked 18.1.3 — renders exactly the same HTML on all 720 practice cases, ~1.71x faster than marked (median over repeated interleaved runs of the 40 generated documents: ~370 ms vs ~650 ms for marked; kit scorer passes 720/720; 100,000 generated fuzz cases identical to marked).
 
-## What changed in v3 (1.65x, from 1.5x)
+## What changed in v4 (1.71x, from 1.65x)
+
+- **Direct-emission inline layer**: `BlockLexer.lex()` no longer builds an inline token tree. Each inline span is rendered straight to HTML by `inlineHtml` / `inlineHtmlInner` (same regexes, delimiter rules, and masking as the token version, so output is identical), and the span's token array holds a single pre-rendered `html` token. This removes one allocation per inline token, the megamorphic token-shape loads, and the separate inline render pass. The block lexer and its token tree are unchanged.
+- **Lazy emphasis masking**: the `maskForEmphasis` + `scanMask` work is done on first use (when the loop first dispatches to `*`, `_`, or `~`), not up front for every span — spans whose delimiters all sit inside code spans or tags skip it entirely.
+- **Plain-text fast path**: a text run with no `& < > " '` is pushed unchanged, skipping the entity-decode + HTML-escape passes.
+- **Correctness fixes found while converting** (all verified by the fuzz set): autolink/url hrefs now go through `sanitizeHref` with the null fallback and the encode-variant escape the renderer uses; link/image labels in `textOnly` mode now render the label's plain text instead of pushing the raw label; the `inlineHtml` plain-span fast path now HTML-escapes the decoded text the way the renderer does.
+- **Driver**: `main.ts` accepts positional `[inputDir] [outputDir]` arguments (overriding the env vars) and its stderr summary now reports input/output byte counts.
+
+Measured head-to-head over 15 interleaved runs of the 40 docs: v4 median ~367 ms vs v3 ~385 ms (~4.7% faster); vs marked ~650 ms that is ~1.71x. The full single-pass scanner (replacing the block token tree too) was attempted and dropped: replacing V8's regexes with manual JS index scanning was *slower* on every pattern tried (code spans, blockSkip pre-check), and the emphasis masking passes are load-bearing for correctness, so the token-based block layer stays.
 
 - **Emphasis/delimiter masking (`maskForEmphasis`)**: the `blockSkip` mask now skips rebuilding a link/code/tag span that holds no `*`/`_`/`~` (returning it unchanged keeps positions aligned, since there is nothing to hide), and the escaped-punctuation pass skips the inner backtick scan when a code span holds no backtick.
 - **`decodeEntities`**: a fast `&` pre-check skips the numeric-reference regex scan for plain text (the common case).

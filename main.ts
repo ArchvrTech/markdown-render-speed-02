@@ -3,18 +3,20 @@
 // /input/cases.json (a JSON array of {id, markdown}), renders each one alone
 // with parse() from ./parse.js, and writes /output/html.json: a JSON array of
 // the HTML strings, one per case and in the cases' order. Outside a container
-// MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR stand in for /input and /output.
+// MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR stand in for /input and /output;
+// positional arguments `node main.ts [inputDir] [outputDir]` override them,
+// which makes local runs (`node main.ts practice/input out`) shorter to type.
 //
 // The input is accepted as either a bare array or an object with a `cases`
 // key (the kit's reference files use the latter shape), so the driver works
 // unchanged against the practice set, the scored set, and a hand-made file.
 
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { parse } from './parse.js';
 
-const inputDir = process.env.MAKEFUN_INPUT_DIR || '/input';
-const outputDir = process.env.MAKEFUN_OUTPUT_DIR || '/output';
+const inputDir = process.argv[2] || process.env.MAKEFUN_INPUT_DIR || '/input';
+const outputDir = process.argv[3] || process.env.MAKEFUN_OUTPUT_DIR || '/output';
 
 // Read and normalise the case list. Every case must carry its markdown as
 // a string; anything else is a malformed input file, not a render decision.
@@ -53,12 +55,14 @@ function renderCases(cases) {
 function main() {
   const cases = readCases();
   const t0 = Date.now();
+  const inBytes = cases.reduce((n, c) => n + c.markdown.length, 0);
   const out = renderCases(cases);
   mkdirSync(outputDir, { recursive: true });
   writeFileSync(join(outputDir, 'html.json'), JSON.stringify(out));
+  const outBytes = statSync(join(outputDir, 'html.json')).size;
   // A one-line summary on stderr: the harness only reads html.json, so
   // this never touches the scored output.
-  console.error(`rendered ${out.length} cases in ${Date.now() - t0} ms -> ${join(outputDir, 'html.json')}`);
+  console.error(`rendered ${out.length} cases in ${Date.now() - t0} ms (${inBytes} input bytes -> ${outBytes} output bytes) -> ${join(outputDir, 'html.json')}`);
 }
 
 main();

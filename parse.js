@@ -452,7 +452,11 @@ class BlockLexer {
     for (let i = 0; i < this.inlineQueue.length; i++) {
       const job = this.inlineQueue[i];
       this.state.inRawBlock = false;
-      inlineTokens(this, job.src, job.tokens);
+      // Direct emission: one pre-rendered HTML token instead of a token
+      // tree. The `html` token type outputs its text as-is, so the
+      // renderer needs no change. A checkbox unshifted into this array
+      // during list lexing stays ahead of the HTML token.
+      job.tokens.push({ type: 'html', raw: job.src, text: inlineHtml(this, job.src), block: false });
     }
     this.inlineQueue = [];
     return this.tokens;
@@ -1487,6 +1491,377 @@ function inlineTokensInner(lx, src, tokens) {
     break; // no tokenizer matched; avoid infinite loop
   }
   return tokens;
+}
+
+// ---------------------------------------------------------------------------
+// Inline direct emission (single-pass, no token tree)
+//
+// The token-tree inline layer above builds an array of token objects and a
+// separate render pass walks it. That costs an allocation per token, a
+// megamorphic property load per field, and a second pass over the same
+// content. The functions below parse inline markup and emit the HTML
+// directly, with no intermediate tokens. The matching logic (regexes,
+// delimiter rules, masking) is identical to the token version; only the
+// output changes. textOnly=true returns plain decoded text (for image alt
+// text) instead of HTML.
+// ---------------------------------------------------------------------------
+
+function escText(s, textOnly) {
+  // A text run in normal mode is HTML-escaped; in textOnly mode it is the
+  // decoded text as-is (the caller escapes it when it becomes an alt).
+  return textOnly ? s : escapeHtml(s);
+}
+
+// Build a link or image's HTML from its parts. Pushes the HTML to `out`
+// and returns the consumed source length, or 0 when the link must not be
+// created (a nested link was emitted inside its label).
+function buildLinkOrImageHtml(lx, match, href, title, raw, out, textOnly) {
+  const isImage = match[0].charCodeAt(0) === 33; // '!'
+  const text = match[1].replace(OUTPUT_LINK_REPLACE, '$1');
+  const savedInLink = lx.state.inLink;
+  const savedEmitted = lx.state.linkEmitted;
+  const savedRaw = lx.state.inRawBlock;
+  lx.state.inLink = true;
+  lx.state.linkEmitted = false;
+  // Parse the label once, in the mode we need it: plain text for an image
+  // alt (or any textOnly render), HTML for a link label. The parse also
+  // tells us whether a link was emitted inside the label.
+  const labelHtml = inlineHtml(lx, text, textOnly || isImage);
+  const emitted = lx.state.linkEmitted;
+  lx.state.linkEmitted = savedEmitted;
+  lx.state.inLink = savedInLink;
+  if (!isImage) {
+    if (emitted) { lx.state.inRawBlock = savedRaw; return 0; }
+    lx.state.linkEmitted = true;
+  }
+  if (textOnly) { out.push(labelHtml); return match[0].length; }
+  if (isImage) {
+    const alt = labelHtml; // already plain text (isImage => textOnly parse)
+    const h = sanitizeHref(href);
+    if (h === null) { out.push(escapeHtml(alt)); return match[0].length; }
+    let o = `<img src="${escapeHtml(h)}" alt="${escapeHtml(alt)}"`;
+    if (title) o += ` title="${escapeHtml(title)}"`;
+    out.push(o + '>');
+    return match[0].length;
+  }
+  const h = sanitizeHref(href);
+  if (h === null) { out.push(labelHtml); return match[0].length; }
+  let l = '<a href="' + escapeHtml(h) + '"';
+  if (title) l += ' title="' + escapeHtml(title) + '"';
+  out.push(l + '>' + labelHtml + '</a>');
+  return match[0].length;
+}
+
+// Each tk*Html below pushes the token's HTML to `out` and returns the
+// number of source characters consumed (0 = no match). textOnly=true makes
+// it push plain decoded text instead of HTML.
+function tkEscapeHtml(src, out, textOnly) {
+  const t = INLINE.escape.exec(src);
+  if (!t) return 0;
+  out.push(textOnly ? t[1] : escapeHtml(t[1]));
+  return t[0].length;
+}
+
+function tkCodespanHtml(src, out, textOnly) {
+  const t = INLINE.code.exec(src);
+  if (!t) return 0;
+  let text = t[2].replace(/\n/g, ' ');
+  const hasNonSpace = /[^ ]/.test(text);
+  const hasEdgeSpace = /^ /.test(text) && / $/.test(text);
+  if (hasNonSpace && hasEdgeSpace) text = text.substring(1, text.length - 1);
+  out.push(textOnly ? text : `<code>${escapeHtml(text, true)}</code>`);
+  return t[0].length;
+}
+
+function tkBrHtml(src, out, textOnly) {
+  const t = INLINE.br.exec(src);
+  if (!t) return 0;
+  if (!textOnly) out.push('<br>');
+  return t[0].length;
+}
+
+function tkTagHtml(lx, src, out, textOnly) {
+  const t = INLINE.tag.exec(src);
+  if (!t) return 0;
+  if (!lx.state.inLink && /^<a /i.test(t[0])) lx.state.inLink = true;
+  else if (lx.state.inLink && /^<\/a>/i.test(t[0])) lx.state.inLink = false;
+  if (!lx.state.inRawBlock && /^<(pre|code|kbd|script)(\s|>)/i.test(t[0])) lx.state.inRawBlock = true;
+  else if (lx.state.inRawBlock && /^<\/(pre|code|kbd|script)(\s|>)/i.test(t[0])) lx.state.inRawBlock = false;
+  out.push(t[0]);
+  return t[0].length;
+}
+
+function tkLinkHtml(lx, src, out, textOnly) {
+  if (lx.state.linkParenPossible === false) return 0;
+  const t = INLINE.link.exec(src);
+  if (!t) return 0;
+  const n = t[0].charAt(0) === '!' ? 2 : 1;
+  if (linkHasTagOrAutolink(src, t[1], n)) return 0;
+  let s = t[2].trim();
+  if (START_ANGLE.test(s)) {
+    if (!END_ANGLE.test(s)) return 0;
+    const l = stripTrailingBackslashes(s.slice(0, -1));
+    if ((s.length - l.length) % 2 === 0) return 0;
+  } else {
+    const l = findParen(t[2], '()');
+    if (l === -2) return 0;
+    if (l > -1) {
+      const h = (t[0].indexOf('!') === 0 ? 5 : 4) + t[1].length + l;
+      t[2] = t[2].substring(0, l);
+      t[0] = t[0].substring(0, h).trim();
+      t[3] = '';
+    }
+  }
+  const r = stripTrailingBackslashes(t[0].slice(0, -1));
+  if ((t[0].length - r.length) % 2 === 0) return 0;
+  let o = t[2], i = '';
+  i = t[3] ? t[3].slice(1, -1) : '';
+  o = o.trim();
+  if (START_ANGLE.test(o)) o = o.slice(1, -1);
+  return buildLinkOrImageHtml(lx, t, o && o.replace(ANY_PUNCT, '$1'), i && i.replace(ANY_PUNCT, '$1'), t[0], out, textOnly);
+}
+
+function tkReflinkHtml(lx, src, out, textOnly) {
+  const n = INLINE.reflink.exec(src) || INLINE.nolink.exec(src);
+  if (!n) return 0;
+  const s = n[0].charAt(0) === '!' ? 2 : 1;
+  if (linkHasTagOrAutolink(src, n[1], s)) return 0;
+  const r = lx.links[normalizeLabel(n[2] || n[1])];
+  if (!r) {
+    const o = n[0].charAt(0);
+    out.push(textOnly ? o : escapeHtml(o));
+    return 1;
+  }
+  return buildLinkOrImageHtml(lx, n, r.href, r.title, n[0], out, textOnly);
+}
+
+function tkEmStrongHtml(lx, src, masked, prevChar, maskInfo, out, textOnly) {
+  let s = INLINE.emStrongLDelim.exec(src);
+  if (!s || (!s[1] && !s[2] && !s[3] && !s[4])) return 0;
+  let n = prevChar;
+  const r = s[0][0], o = n === r, i = masked.length - src.length;
+  let l = i;
+  while (l > 0 && masked[l - 1] === r) l--;
+  let p;
+  if (l === 0) p = '';
+  else {
+    const pc = masked.charCodeAt(l - 1);
+    p = (pc >= 0xDC00 && pc <= 0xDFFF && l >= 2) ? masked.slice(l - 2, l) : masked[l - 1];
+  }
+  const h = p === '*' || p === '_' || isPunctChar(p);
+  if (l < i) n = p;
+  const u = l < i ? h : isPunctChar(n);
+  if (s[4] && UNICODE_ALNUM.test(n)) return 0;
+  const d = s[1] || s[3] || '';
+  if (!d || !n || u) {
+    const lastC = s[0].charCodeAt(s[0].length - 1);
+    const k = (lastC >= 0xDC00 && lastC <= 0xDFFF) ? [...s[0]].length - 1 : s[0].length - 1;
+    let g, b, m = k, f = 0;
+    const y = i - l + k;
+    const R = !!p.trim() && (!!d || (r === '*' && !h));
+    if (r !== '*' && r !== '_') return 0;
+    const A = r === '*' ? INLINE.emStrongRDelimAst : INLINE.emStrongRDelimUnd;
+    const v = r === '*' ? maskInfo.star : maskInfo.under;
+    const Q = masked.length - src.length + k;
+    if (v < Q) return 0;
+    const t = masked.slice(-1 * src.length + k);
+    const ee = v - Q;
+    for (A.lastIndex = 0; (s = A.exec(t)) !== null && !(s.index > ee);) {
+      if (g = s[1] || s[2] || s[3] || s[4] || s[5] || s[6], !g) continue;
+      if (b = g.length, s[3] || s[4]) { m += b; continue; }
+      else if (s[5] || s[6] || R) {
+        if (o && (s[5] || s[6])) break;
+        if (y % 3 && !((y + b) % 3)) { f += b; continue; }
+      }
+      if (m -= b, m > 0) continue;
+      b = Math.min(b, b + m + f);
+      const c0 = s[0].charCodeAt(0);
+      const te = (c0 >= 0xD800 && c0 <= 0xDBFF) ? 2 : 1;
+      const M = src.slice(0, k + s.index + te + b);
+      if (Math.min(k, b) % 2) {
+        const U = M.slice(1, -1);
+        if (textOnly) { out.push(inlineHtml(lx, U, true)); return M.length; }
+        out.push(`<em>${inlineHtml(lx, U, false)}</em>`);
+        return M.length;
+      }
+      const ne = M.slice(2, -2);
+      if (textOnly) { out.push(inlineHtml(lx, ne, true)); return M.length; }
+      out.push(`<strong>${inlineHtml(lx, ne, false)}</strong>`);
+      return M.length;
+    }
+  }
+  return 0;
+}
+
+function tkDelHtml(lx, src, masked, prevChar, maskInfo, out, textOnly) {
+  let s = INLINE.delLDelim.exec(src);
+  if (!s) return 0;
+  if (!(s[1] || '') || !prevChar || isPunctChar(prevChar)) {
+    const lastC = s[0].charCodeAt(s[0].length - 1);
+    const o = (lastC >= 0xDC00 && lastC <= 0xDFFF) ? [...s[0]].length - 1 : s[0].length - 1;
+    let i, l, p = o;
+    const h = INLINE.delRDelim, u = maskInfo.tilde, d = masked.length - src.length + o;
+    if (u < d) return 0;
+    const t = masked.slice(-1 * src.length + o);
+    const k = u - d;
+    for (h.lastIndex = 0; (s = h.exec(t)) !== null && !(s.index > k);) {
+      if (i = s[1] || s[2] || s[3] || s[4] || s[5] || s[6], !i || (l = i.length, l !== o)) continue;
+      if (s[3] || s[4]) { p += l; continue; }
+      if (p -= l, p > 0) continue;
+      l = Math.min(l, l + p);
+      const c0 = s[0].charCodeAt(0);
+      const g = (c0 >= 0xD800 && c0 <= 0xDBFF) ? 2 : 1;
+      const b = src.slice(0, o + s.index + g + l);
+      const m = b.slice(o, -o);
+      if (textOnly) { out.push(inlineHtml(lx, m, true)); return b.length; }
+      out.push(`<del>${inlineHtml(lx, m, false)}</del>`);
+      return b.length;
+    }
+  }
+  return 0;
+}
+
+function tkAutolinkHtml(src, out, textOnly) {
+  const t = INLINE.autolink.exec(src);
+  if (!t) return 0;
+  let text, href;
+  if (t[2] === '@') { text = t[1]; href = 'mailto:' + text; }
+  else { text = t[1]; href = text; }
+  if (textOnly) { out.push(text); return t[0].length; }
+  // Render matches renderInlineTokens for an autolink link token: the
+  // link text is escaped with encode, the href is sanitized, and a null
+  // sanitize result falls back to plain text.
+  const h = sanitizeHref(href);
+  if (h === null) { out.push(escapeHtml(text, true)); return t[0].length; }
+  out.push(`<a href="${escapeHtml(h, true)}">${escapeHtml(text, true)}</a>`);
+  return t[0].length;
+}
+
+function tkUrlHtml(src, out, textOnly) {
+  const t = INLINE.url.exec(src);
+  if (!t) return 0;
+  let text, href;
+  if (t[2] === '@') { text = t[0]; href = 'mailto:' + text; }
+  else {
+    let prev;
+    do {
+      prev = t[0];
+      t[0] = INLINE.backpedal.exec(t[0])?.[0] ?? '';
+    } while (prev !== t[0]);
+    text = t[0];
+    href = t[1] === 'www.' ? 'http://' + t[0] : t[0];
+  }
+  if (textOnly) { out.push(text); return t[0].length; }
+  const h = sanitizeHref(href);
+  if (h === null) { out.push(escapeHtml(text, true)); return t[0].length; }
+  out.push(`<a href="${escapeHtml(h, true)}">${escapeHtml(text, true)}</a>`);
+  return t[0].length;
+}
+
+function tkInlineTextHtml(lx, src, out, textOnly) {
+  const end = scanTextEnd(src, 0);
+  if (end > 0) {
+    const raw = src.slice(0, end);
+    if (raw.indexOf('@') === -1 && raw.indexOf('://') === -1 && raw.indexOf('www.') === -1
+      && raw.indexOf('mailto:') === -1 && raw.indexOf('xmpp:') === -1
+      && !emailAfterUnderscore(src, end)) {
+      const inRaw = lx.state.inRawBlock;
+      if (textOnly) { out.push(raw); return end; }
+      // Plain text with no & < > " ' is unchanged by entity decoding and
+      // HTML escaping alike: push it directly, skipping both passes.
+      if (inRaw || !/[&<>"']/.test(raw)) { out.push(raw); return end; }
+      // Match the token model: text is entity-decoded, then HTML-escaped
+      // (no-encode variant, so decoded entities are preserved).
+      out.push(escapeHtml(decodeEntities(raw)));
+      return end;
+    }
+  }
+  const t = INLINE.text.exec(src);
+  if (!t) return 0;
+  const inRaw = lx.state.inRawBlock;
+  if (textOnly) { out.push(t[0]); return t[0].length; }
+  if (inRaw || !/[&<>"']/.test(t[0])) { out.push(t[0]); return t[0].length; }
+  out.push(escapeHtml(decodeEntities(t[0])));
+  return t[0].length;
+}
+
+// Direct-emission inline parser: returns the HTML (or plain text when
+// textOnly) for `src`, with no token objects. Mirrors inlineTokens /
+// inlineTokensInner exactly, including the linkParenPossible guard and
+// the emphasis masking.
+function inlineHtml(lx, src, textOnly = false) {
+  const saved = lx.state.linkParenPossible;
+  lx.state.linkParenPossible = saved && src.includes(')');
+  try {
+    if (src !== '' && !INLINE_FAST_FAIL.test(src)) {
+      const inRaw = lx.state.inRawBlock;
+      if (textOnly) return src;
+      // Match the token model: a plain-text token is entity-decoded, then
+      // HTML-escaped at render time (no-encode variant).
+      return inRaw ? src : escapeHtml(decodeEntities(src));
+    }
+    return inlineHtmlInner(lx, src, textOnly);
+  } finally {
+    lx.state.linkParenPossible = saved;
+  }
+}
+
+function inlineHtmlInner(lx, src, textOnly) {
+  // The emphasis mask is only needed when the loop actually dispatches to
+  // an emphasis/delimiter tokeniser (*, _, ~). Spans whose delimiters all
+  // sit inside code spans or tags never reach one, so building the mask
+  // up front (three regex passes over the whole span) is wasted work.
+  // Compute it lazily on first use instead (inline null check, no closure).
+  let masked = null;
+  let maskInfo = null;
+  let s = false, r = '', o = Infinity;
+  let e = src;
+  const parts = [];
+  while (e) {
+    if (e.length < o) o = e.length;
+    else break;
+    if (!s) r = '';
+    s = false;
+    let n;
+    const ch = e.charCodeAt(0);
+    if (ch === 92) {
+      if ((n = tkEscapeHtml(e, parts, textOnly)) > 0) { e = e.substring(n); continue; }
+      if ((n = tkBrHtml(e, parts, textOnly)) > 0) { e = e.substring(n); continue; }
+    } else if (ch === 60) {
+      if ((n = tkTagHtml(lx, e, parts, textOnly)) > 0) { e = e.substring(n); continue; }
+      if ((n = tkAutolinkHtml(e, parts, textOnly)) > 0) { e = e.substring(n); continue; }
+    } else if (ch === 91 || ch === 33) {
+      if ((n = tkLinkHtml(lx, e, parts, textOnly)) > 0) { e = e.substring(n); continue; }
+      if ((n = tkReflinkHtml(lx, e, parts, textOnly)) > 0) { e = e.substring(n); continue; }
+    } else if (ch === 42) {
+      if (masked === null) { masked = maskForEmphasis(lx, src); maskInfo = scanMask(masked); }
+      if ((n = tkEmStrongHtml(lx, e, masked, r, maskInfo, parts, textOnly)) > 0) { e = e.substring(n); continue; }
+    } else if (ch === 95) {
+      if (masked === null) { masked = maskForEmphasis(lx, src); maskInfo = scanMask(masked); }
+      if ((n = tkEmStrongHtml(lx, e, masked, r, maskInfo, parts, textOnly)) > 0) { e = e.substring(n); continue; }
+      if (!lx.state.inLink && (n = tkUrlHtml(e, parts, textOnly)) > 0) { e = e.substring(n); continue; }
+    } else if (ch === 96) {
+      if ((n = tkCodespanHtml(e, parts, textOnly)) > 0) { e = e.substring(n); continue; }
+    } else if (ch === 126) {
+      if (masked === null) { masked = maskForEmphasis(lx, src); maskInfo = scanMask(masked); }
+      if ((n = tkDelHtml(lx, e, masked, r, maskInfo, parts, textOnly)) > 0) { e = e.substring(n); continue; }
+    } else if (ch === 32) {
+      if ((n = tkBrHtml(e, parts, textOnly)) > 0) { e = e.substring(n); continue; }
+    } else {
+      if (!lx.state.inLink && (n = tkUrlHtml(e, parts, textOnly)) > 0) { e = e.substring(n); continue; }
+    }
+    if ((n = tkInlineTextHtml(lx, e, parts, textOnly)) > 0) {
+      // Track the previous character for emphasis masking (same rule as
+      // the token version: the last char of the text run, unless it is _).
+      const lastC = e.charCodeAt(n - 1);
+      if (lastC !== 95) r = e[n - 1];
+      s = true;
+      e = e.substring(n);
+      continue;
+    }
+    break;
+  }
+  return parts.join('');
 }
 
 // ---------------------------------------------------------------------------
