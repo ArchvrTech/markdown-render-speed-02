@@ -36,7 +36,9 @@ const NUMERIC_REF_OR_AMP = /&#(?:(\d{1,7})|[Xx]([A-Fa-f0-9]{1,6}));|&(?!(#\d{1,7
 
 // Decode numeric character references; a bare & becomes &amp;.
 function decodeEntities(str) {
-  if (!NUMERIC_REF.test(str)) return str;
+  // A numeric reference needs &#, hence &. Skip the regex scan when the
+  // string has no & at all (the common case for plain text).
+  if (!str.includes('&') || !NUMERIC_REF.test(str)) return str;
   return str.replace(NUMERIC_REF_OR_AMP, (whole, dec, hex) => {
     if (dec === undefined && hex === undefined) return '&amp;';
     const code = hex === undefined ? parseInt(dec, 10) : parseInt(hex, 16);
@@ -360,6 +362,14 @@ const UNICODE_ALNUM = /[\p{L}\p{N}]/u;
 const NOT_SPACE_START = /^\S*/;
 const ENDING_NEWLINE = /\n$/;
 const SPACE_LINE = /^ +$/gm;
+
+// Whitespace set matching String.prototype.trim() (for blank-line checks
+// without allocating a trimmed copy). Indexed by char code < 256.
+const TRIM_WS = new Uint8Array(256);
+for (const c of [9, 11, 12, 13, 32, 160]) TRIM_WS[c] = 1;
+function isTrimWSUnicode(c) {
+  return c === 0x1680 || (c >= 0x2000 && c <= 0x200A) || c === 0x2028 || c === 0x2029 || c === 0x202F || c === 0x205F || c === 0x3000 || c === 0xFEFF;
+}
 
 const itemRegexCache = new Map();
 function listItemRegex(marker) {
@@ -785,7 +795,17 @@ BlockLexer.prototype.list = function (src) {
             if (expanded.charCodeAt(k) !== 32) { fns = k; break; }
           }
         }
-        const isBlank = line.trim() === '';
+        // Blank = only trim-whitespace (same as line.trim() === ''), but
+        // without allocating a trimmed copy of the line. Start at ni (the
+        // first non-space char); everything before it is spaces. Content
+        // lines fail on the first iteration, blank lines scan to the end.
+        let isBlank = true;
+        for (let b = ni; b < line.length; b++) {
+          const bc = line.charCodeAt(b);
+          if (bc < 256 ? TRIM_WS[bc] : isTrimWSUnicode(bc)) continue;
+          isBlank = false;
+          break;
+        }
         // Fast dispatch: the six break regexes all start with ^ {0,maxSp}
         // followed by a marker char; skip the ones the first non-space
         // character cannot start (most content lines match none of them).
@@ -801,8 +821,12 @@ BlockLexer.prototype.list = function (src) {
           else if (ch === '_') hit = hrAt.test(line);
         }
         if (hit) break;
+        // The line's content after the list indent, computed once: it is
+        // both the pushed content (when the line fits) and the next
+        // iteration's firstContent (the previous line's content).
+        const content = expanded.slice(indent);
         if (fns >= indent || isBlank) {
-          itemLines.push(expanded.slice(indent));
+          itemLines.push(content);
         } else {
           if (firstBlank || firstContent.replace(TAB_GLOBAL, '    ').search(NON_SPACE_CHAR) >= 4 || fencesAt.test(firstContent) || headingAt.test(firstContent) || htmlAt.test(firstContent) || hrAt.test(firstContent)) break;
           const setext = /^ {0,3}(?:=+|-+) *$/.test(line) && RE.lheading.test(`${firstContent}\n${line}`)
@@ -811,7 +835,7 @@ BlockLexer.prototype.list = function (src) {
         }
         firstBlank = isBlank;
         src = src.substring(line.length + 1);
-        firstContent = expanded.slice(indent);
+        firstContent = content;
       }
     }
     const itemText = itemLines.join('\n');
@@ -881,6 +905,19 @@ BlockLexer.prototype.list = function (src) {
 // ---------------------------------------------------------------------------
 // Inline rules
 // ---------------------------------------------------------------------------
+
+// ASCII whitespace/punctuation/symbol chars (the punctSpace class), except
+// * and _ which the punctuation regex's (?![*_]) lookahead excludes.
+// Lets single-char punctuation tests skip the regex; non-ASCII falls back.
+const ASCII_PUNCT_WS = new Uint8Array(128);
+for (const c of [9, 10, 11, 12, 13, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 43, 44, 45, 46, 47, 58, 59, 60, 61, 62, 63, 64, 91, 92, 93, 94, 96, 123, 124, 125, 126]) ASCII_PUNCT_WS[c] = 1;
+function isPunctChar(ch) {
+  if (ch.length === 1) {
+    const c = ch.charCodeAt(0);
+    if (c < 128) return !!ASCII_PUNCT_WS[c];
+  }
+  return !!INLINE.punctuation.exec(ch);
+}
 
 const SCHEME_RE = /[hH][tT][tT][pP][sS]?|[fF][tT][pP]/;
 const PUNCT = '[\\p{P}\\p{S}]';
@@ -1074,14 +1111,25 @@ function tkEmStrong(lx, src, masked, prevChar, maskInfo) {
   const r = s[0][0], o = n === r, i = masked.length - src.length;
   let l = i;
   while (l > 0 && masked[l - 1] === r) l--;
-  const p = [...masked.slice(Math.max(0, l - 2), l)].at(-1) ?? '';
-  const h = p === '*' || p === '_' || !!INLINE.punctuation.exec(p);
+  // The char before the delimiter run, as one code point. Fast path for
+  // BMP (the common case); only slice when it's a surrogate pair.
+  let p;
+  if (l === 0) p = '';
+  else {
+    const pc = masked.charCodeAt(l - 1);
+    p = (pc >= 0xDC00 && pc <= 0xDFFF && l >= 2) ? masked.slice(l - 2, l) : masked[l - 1];
+  }
+  const h = p === '*' || p === '_' || isPunctChar(p);
   if (l < i) n = p;
-  const u = l < i ? h : !!INLINE.punctuation.exec(n);
+  const u = l < i ? h : isPunctChar(n);
   if (s[4] && UNICODE_ALNUM.test(n)) return undefined;
   const d = s[1] || s[3] || '';
   if (!d || !n || u) {
-    const k = [...s[0]].length - 1;
+    // k = opening-delimiter length in code points. The match is the
+    // delimiter run plus (usually) one following char; subtract that one.
+    // .length equals the code-point count unless the last char is astral.
+    const lastC = s[0].charCodeAt(s[0].length - 1);
+    const k = (lastC >= 0xDC00 && lastC <= 0xDFFF) ? [...s[0]].length - 1 : s[0].length - 1;
     let g, b, m = k, f = 0;
     const y = i - l + k;
     const R = !!p.trim() && (!!d || (r === '*' && !h));
@@ -1094,14 +1142,16 @@ function tkEmStrong(lx, src, masked, prevChar, maskInfo) {
     const ee = v - Q;
     for (A.lastIndex = 0; (s = A.exec(t)) !== null && !(s.index > ee);) {
       if (g = s[1] || s[2] || s[3] || s[4] || s[5] || s[6], !g) continue;
-      if (b = [...g].length, s[3] || s[4]) { m += b; continue; }
+      if (b = g.length, s[3] || s[4]) { m += b; continue; }
       else if (s[5] || s[6] || R) {
         if (o && (s[5] || s[6])) break;
         if (y % 3 && !((y + b) % 3)) { f += b; continue; }
       }
       if (m -= b, m > 0) continue;
       b = Math.min(b, b + m + f);
-      const te = [...s[0]][0].length;
+      // UTF-16 length of the first code point of the RDelim match.
+      const c0 = s[0].charCodeAt(0);
+      const te = (c0 >= 0xD800 && c0 <= 0xDBFF) ? 2 : 1;
       const M = src.slice(0, k + s.index + te + b);
       if (Math.min(k, b) % 2) {
         const U = M.slice(1, -1);
@@ -1117,19 +1167,25 @@ function tkEmStrong(lx, src, masked, prevChar, maskInfo) {
 function tkDel(lx, src, masked, prevChar, maskInfo) {
   let s = INLINE.delLDelim.exec(src);
   if (!s) return undefined;
-  if (!(s[1] || '') || !prevChar || INLINE.punctuation.exec(prevChar)) {
-    const o = [...s[0]].length - 1;
+  if (!(s[1] || '') || !prevChar || isPunctChar(prevChar)) {
+    // o = opening-delimiter length in code points (match minus one
+    // following char); .length equals the code-point count unless the
+    // last char is astral.
+    const lastC = s[0].charCodeAt(s[0].length - 1);
+    const o = (lastC >= 0xDC00 && lastC <= 0xDFFF) ? [...s[0]].length - 1 : s[0].length - 1;
     let i, l, p = o;
     const h = INLINE.delRDelim, u = maskInfo.tilde, d = masked.length - src.length + o;
     if (u < d) return undefined;
     const t = masked.slice(-1 * src.length + o);
     const k = u - d;
     for (h.lastIndex = 0; (s = h.exec(t)) !== null && !(s.index > k);) {
-      if (i = s[1] || s[2] || s[3] || s[4] || s[5] || s[6], !i || (l = [...i].length, l !== o)) continue;
+      if (i = s[1] || s[2] || s[3] || s[4] || s[5] || s[6], !i || (l = i.length, l !== o)) continue;
       if (s[3] || s[4]) { p += l; continue; }
       if (p -= l, p > 0) continue;
       l = Math.min(l, l + p);
-      const g = [...s[0]][0].length;
+      // UTF-16 length of the first code point of the RDelim match.
+      const c0 = s[0].charCodeAt(0);
+      const g = (c0 >= 0xD800 && c0 <= 0xDBFF) ? 2 : 1;
       const b = src.slice(0, o + s.index + g + l);
       const m = b.slice(o, -o);
       return { type: 'del', raw: b, text: m, tokens: inlineTokens(lx, m) };
@@ -1173,11 +1229,20 @@ function tkInlineText(lx, src) {
   // then check for URL/email triggers only inside that run — a trigger
   // beyond the run belongs to a later token, not this one. This avoids
   // rescanning the whole remaining paragraph on every text token.
+  //
+  // One exception: when the run stops at an intraword _ that is part of an
+  // email local part (b___foo@bar.com), the @ sits beyond the run, so the
+  // in-run check would miss it and the run's prefix would be returned as
+  // plain text, truncating the email. If a @ follows within email-local
+  // chars, fall back to the text regex, which stops before the email.
+  // Falling back is always correct (it is the original regex); it only
+  // costs a regex run on a rare shape.
   const end = scanTextEnd(src, 0);
   if (end > 0) {
     const raw = src.slice(0, end);
     if (raw.indexOf('@') === -1 && raw.indexOf('://') === -1 && raw.indexOf('www.') === -1
-      && raw.indexOf('mailto:') === -1 && raw.indexOf('xmpp:') === -1) {
+      && raw.indexOf('mailto:') === -1 && raw.indexOf('xmpp:') === -1
+      && !emailAfterUnderscore(src, end)) {
       const inRaw = lx.state.inRawBlock;
       return { type: 'text', raw, text: inRaw ? raw : decodeEntities(raw), escaped: inRaw };
     }
@@ -1188,6 +1253,23 @@ function tkInlineText(lx, src) {
     return { type: 'text', raw: t[0], text: inRaw ? t[0] : decodeEntities(t[0]), escaped: inRaw };
   }
   return undefined;
+}
+
+// True when the text run ends at an intraword _ that belongs to an email
+// local part: the char before the _ is an email-local char, and scanning
+// forward over email-local chars ([A-Za-z0-9._+-]) from the _ reaches a @.
+function emailAfterUnderscore(src, end) {
+  if (end >= src.length || src.charCodeAt(end) !== 95) return false;
+  const pc = src.charCodeAt(end - 1);
+  if (!((pc >= 48 && pc <= 57) || (pc >= 65 && pc <= 90) || (pc >= 97 && pc <= 122) || pc === 95 || pc === 46 || pc === 43 || pc === 45)) return false;
+  let f = end;
+  const n = src.length;
+  while (f < n) {
+    const c = src.charCodeAt(f);
+    if (!((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c === 95 || c === 46 || c === 43 || c === 45)) break;
+    f++;
+  }
+  return f < n && src.charCodeAt(f) === 64;
 }
 
 // End index (exclusive) of the plain-text run starting at `start`, matching
@@ -1225,22 +1307,26 @@ function scanTextEnd(src, start) {
 // ---------------------------------------------------------------------------
 
 function scanMask(str) {
-  const last = { '*': -1, '_': -1 };
-  let tilde = -1;
+  // charCodeAt (numbers) instead of str[i] (1-char strings): the loop
+  // touches every character, and allocating a string per char is pure
+  // overhead. The excluded prev chars match the original exactly
+  // (space, tab, LF, CR, FF — notably NOT VT).
+  let star = -1, under = -1, tilde = -1;
   const n = str.length;
   for (let i = 0; i < n; i++) {
-    const ch = str[i];
-    if (ch !== '*' && ch !== '_' && ch !== '~') continue;
-    const prev = i === 0 ? '\n' : str[i - 1];
+    const c = str.charCodeAt(i);
+    if (c !== 42 && c !== 95 && c !== 126) continue;
+    const pc = i === 0 ? 10 : str.charCodeAt(i - 1);
     let j = i + 1;
-    while (j < n && str[j] === ch) j++;
-    if (prev !== ' ' && prev !== '\t' && prev !== '\n' && prev !== '\r' && prev !== '\f') {
-      if (ch === '~') tilde = i;
-      else last[ch] = i;
+    while (j < n && str.charCodeAt(j) === c) j++;
+    if (pc !== 32 && pc !== 9 && pc !== 10 && pc !== 13 && pc !== 12) {
+      if (c === 126) tilde = i;
+      else if (c === 42) star = i;
+      else under = i;
     }
     i = j - 1;
   }
-  return { star: last['*'], under: last['_'], tilde };
+  return { star, under, tilde };
 }
 
 function linkInText(lx, e) {
@@ -1285,15 +1371,21 @@ function maskForEmphasis(lx, src) {
   // anyPunctOutsideCode only changes backslash-escaped punctuation and
   // backticks inside code spans; skip the scan when neither can occur.
   if (src.includes('\\') || src.includes('`')) {
-    t = t.replace(INLINE.anyPunctOutsideCode, (m, backticks, punct) =>
-      punct ? '+'.repeat(m.length)
-      : backticks ? backticks + m.slice(backticks.length, -backticks.length).replace(/`/g, '+') + backticks
-      : m);
+    t = t.replace(INLINE.anyPunctOutsideCode, (m, backticks, punct) => {
+      if (punct) return '+'.repeat(m.length);
+      if (!backticks) return m;
+      // Inner backticks are rare: only scan the content when one is present.
+      const inner = m.slice(backticks.length, -backticks.length);
+      return backticks + (inner.includes('`') ? inner.replace(/`/g, '+') : inner) + backticks;
+    });
   }
   // blockSkip only hides [...]() links, code spans, and <...> tags; skip
   // the scan when none of their opening sequences can occur.
   if (src.includes('](') || src.includes('`') || src.includes('<')) {
     t = t.replace(INLINE.blockSkip, (m, a, b) => {
+      // Masking only matters when the hidden span holds an emphasis
+      // delimiter; otherwise return it unchanged (no 'a' string built).
+      if (m.indexOf('*') === -1 && m.indexOf('_') === -1 && m.indexOf('~') === -1) return m;
       const o = b ? b.length : 0;
       return m.slice(0, o) + '[' + 'a'.repeat(m.length - o - 2) + ']';
     });
@@ -1309,6 +1401,10 @@ const INLINE_PLAIN = /[\\`<\[*_~]/;
 const INLINE_BR = / {2,}\n/;
 // URL/email triggers (protocol match is case-insensitive in marked).
 const INLINE_URL_TRIG = /https?:|ftp:|www\.|@|mailto:|xmpp:/i;
+// One scan for the inlineTokens fast path instead of three: the fast path
+// is taken iff NONE of PLAIN/BR/URL_TRIG match, so a single alternation
+// (case-insensitive, as URL_TRIG is) is equivalent.
+const INLINE_FAST_FAIL = /[\\`<\[*_~]| {2,}\n|https?:|ftp:|www\.|@|mailto:|xmpp:/i;
 
 function inlineTokens(lx, src, tokens = []) {
   const saved = lx.state.linkParenPossible;
@@ -1319,7 +1415,7 @@ function inlineTokens(lx, src, tokens = []) {
     // so a single text token is the identical result (entity-decoded
     // unless inside a raw block). Guarded by: no escape/tag/link/code/
     // emphasis/del chars, no URL/email trigger, no hard-break run.
-    if (src !== '' && !INLINE_PLAIN.test(src) && !INLINE_BR.test(src) && !INLINE_URL_TRIG.test(src)) {
+    if (src !== '' && !INLINE_FAST_FAIL.test(src)) {
       const inRaw = lx.state.inRawBlock;
       tokens.push({ type: 'text', raw: src, text: inRaw ? src : decodeEntities(src), escaped: inRaw });
       return tokens;
@@ -1381,7 +1477,7 @@ function inlineTokensInner(lx, src, tokens) {
     }
     if (i = tkInlineText(lx, e)) {
       e = e.substring(i.raw.length);
-      if (i.raw.slice(-1) !== '_') r = i.raw.slice(-1);
+      if (i.raw.charCodeAt(i.raw.length - 1) !== 95) r = i.raw[i.raw.length - 1];
       s = true;
       const p = tokens.at(-1);
       if (p?.type === 'text') { p.raw += i.raw; p.text += i.text; }
@@ -1514,7 +1610,7 @@ function renderInlineTokens(tokens, textOnly = false) {
       case 'codespan': out += `<code>${escapeHtml(tok.text, true)}</code>`; break;
       case 'br': out += '<br>'; break;
       case 'del': out += `<del>${renderInlineTokens(tok.tokens)}</del>`; break;
-      case 'text': out += renderInlineText(tok); break;
+      case 'text': out += tok.tokens ? renderInlineTokens(tok.tokens) : (tok.escaped ? tok.text : escapeHtml(tok.text)); break;
     }
   }
   return out;

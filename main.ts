@@ -35,20 +35,30 @@ function readCases() {
 
 // Render every case in order. The output array is preallocated so the
 // result has exactly one entry per case, in the cases' order, even for an
-// empty input.
+// empty input. Each render must be a string; a non-string is a bug in the
+// parser, not a render decision, so fail loudly instead of writing a
+// malformed html.json that would score zero.
 function renderCases(cases) {
   const out = new Array(cases.length);
   for (let i = 0; i < cases.length; i++) {
-    out[i] = parse(cases[i].markdown);
+    const html = parse(cases[i].markdown);
+    if (typeof html !== 'string') {
+      throw new Error(`case ${i} (${cases[i].id ?? '?'}) did not render to a string`);
+    }
+    out[i] = html;
   }
   return out;
 }
 
 function main() {
   const cases = readCases();
+  const t0 = Date.now();
   const out = renderCases(cases);
   mkdirSync(outputDir, { recursive: true });
   writeFileSync(join(outputDir, 'html.json'), JSON.stringify(out));
+  // A one-line summary on stderr: the harness only reads html.json, so
+  // this never touches the scored output.
+  console.error(`rendered ${out.length} cases in ${Date.now() - t0} ms -> ${join(outputDir, 'html.json')}`);
 }
 
 main();
